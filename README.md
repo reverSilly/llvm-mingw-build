@@ -149,6 +149,7 @@ Frequently used options:
 | `--jobs N`, `--link-jobs N` | parallelism (link-jobs 1 by default) |
 | `--native` | use the host compiler instead of MinGW (validation) |
 | `--toolchain-dir DIR` | use an already extracted toolchain |
+| `--component NAME` | install only one CMake component (staged installs) |
 | `--skip-download` | use cached archives only (air-gapped) |
 | `--cmake-arg KEY=VALUE` | raw extra CMake flag, repeatable |
 | `--archive zip,7z` | output formats |
@@ -203,7 +204,7 @@ cmake/
   toolchain-mingw-winlibs.cmake   CMake toolchain file (native + cross)
 CMakePresets.json            presets for winlibs-core / -everything / -minimal
 .github/workflows/           the Windows CI build
-tests/                       42 unit tests (no network required)
+tests/                       46 unit tests (no network required)
 Makefile                     convenience targets
 ```
 
@@ -251,5 +252,7 @@ The driver is exercised for real, not just written:
 | CMake configure of the full `core` scope, all 20 targets | Linux sandbox, GCC 12 | pass, 20 s, 37 954 ninja targets |
 | CMake configure of `everything` minus flang (lldb + polly + mlir) | Linux sandbox | pass, LLDB 23.1.2 detected |
 | real compilation: `llvm-tblgen`, `FileCheck`, `llvm-config`, `count`, `not` | Linux sandbox | pass, 344 targets / 308 s; `llvm-config --version` → 23.1.2 |
+| full `all` pipeline via `build.sh` (fetch → configure → build → stage skipping) | Linux sandbox | pass, exit 0 |
+| `install` stage (`cmake --install`, incl. `--component`) | Linux sandbox | pass |
 | packaging + sha256/sha512 + smoke test | Linux sandbox | pass |
 | the winlibs build itself | requires Windows | run it via the workflow above |

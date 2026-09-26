@@ -106,6 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--generator", default="Ninja", help="CMake generator (default: Ninja)")
     g.add_argument("--jobs", "-j", type=int, default=None, help="compile parallelism (default: nproc)")
     g.add_argument("--link-jobs", type=int, default=1, help="parallel link jobs (default: 1, avoids OOM)")
+    g.add_argument("--component", default=None,
+                   help="install only this CMake component (e.g. cmake-exports); "
+                        "useful for staged installs")
     g.add_argument("--build-targets", default=None,
                    help="only build these ninja targets, e.g. 'llvm-tblgen;FileCheck' (default: everything)")
     g.add_argument("--cmake-arg", action="append", default=[], metavar="KEY=VALUE",
@@ -348,9 +351,12 @@ def cmd_build(cfg: BuildConfig, args: argparse.Namespace) -> int:
 def cmd_install(cfg: BuildConfig, args: argparse.Namespace) -> int:
     runner = _runner(cfg)
     try:
-        builder.install(cfg, runner)
+        dest = builder.install(cfg, runner, component=args.component)
     finally:
         runner.close()
+    if not args.quiet and not cfg.dry_run:
+        count = sum(len(files) for _r, _d, files in os.walk(dest))
+        print(f"[install] {count} file(s) under {dest}")
     return 0
 
 
