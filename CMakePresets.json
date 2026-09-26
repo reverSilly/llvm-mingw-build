@@ -1,0 +1,94 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "lmb-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../work/build",
+      "installDir": "${sourceDir}/../work/install",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LLVM_ENABLE_ASSERTIONS": "OFF",
+        "LLVM_INCLUDE_TESTS": "OFF",
+        "LLVM_INCLUDE_BENCHMARKS": "OFF",
+        "LLVM_INCLUDE_EXAMPLES": "OFF",
+        "LLVM_INCLUDE_DOCS": "OFF",
+        "LLVM_ENABLE_RTTI": "ON",
+        "LLVM_ENABLE_EH": "ON",
+        "LLVM_ENABLE_TERMINFO": "OFF",
+        "LLVM_ENABLE_LIBXML2": "OFF",
+        "LLVM_ENABLE_ZLIB": "ON",
+        "LLVM_ENABLE_ZSTD": "OFF",
+        "LLVM_PARALLEL_LINK_JOBS": "1",
+        "LLVM_INSTALL_TOOLCHAIN_ONLY": "ON",
+        "LLVM_HOST_TRIPLE": "x86_64-w64-mingw32",
+        "LLVM_DEFAULT_TARGET_TRIPLE": "x86_64-w64-mingw32",
+        "CMAKE_EXE_LINKER_FLAGS": "-static-libgcc -static-libstdc++",
+        "CMAKE_SHARED_LINKER_FLAGS": "-static-libgcc -static-libstdc++"
+      }
+    },
+    {
+      "name": "winlibs-core",
+      "displayName": "winlibs MinGW-w64 - core toolchain (clang, clang-tools-extra, lld, mlir)",
+      "inherits": "lmb-base",
+      "toolchainFile": "${sourceDir}/../cmake/toolchain-mingw-winlibs.cmake",
+      "cacheVariables": {
+        "LLVM_ENABLE_PROJECTS": "clang;clang-tools-extra;lld;mlir",
+        "LLVM_ENABLE_RUNTIMES": "libcxx;libcxxabi;libunwind",
+        "LLVM_TARGETS_TO_BUILD": "all",
+        "WINLIBS_ROOT": "$env{WINLIBS_ROOT}"
+      }
+    },
+    {
+      "name": "winlibs-everything",
+      "displayName": "winlibs MinGW-w64 - the whole monorepo (adds lldb, flang, polly, runtimes)",
+      "inherits": "winlibs-core",
+      "cacheVariables": {
+        "LLVM_ENABLE_PROJECTS": "clang;clang-tools-extra;lld;lldb;mlir;flang;polly",
+        "LLVM_ENABLE_RUNTIMES": "libcxx;libcxxabi;libunwind;openmp;compiler-rt",
+        "LLDB_ENABLE_PYTHON": "OFF",
+        "LLDB_ENABLE_LIBEDIT": "OFF",
+        "LLDB_ENABLE_CURSES": "OFF",
+        "LLDB_INCLUDE_TESTS": "OFF",
+        "FLANG_INCLUDE_TESTS": "OFF",
+        "MLIR_INCLUDE_TESTS": "OFF",
+        "CLANG_INCLUDE_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "winlibs-minimal",
+      "displayName": "winlibs MinGW-w64 - minimal (clang, X86 only)",
+      "inherits": "lmb-base",
+      "toolchainFile": "${sourceDir}/../cmake/toolchain-mingw-winlibs.cmake",
+      "cacheVariables": {
+        "LLVM_ENABLE_PROJECTS": "clang",
+        "LLVM_ENABLE_RUNTIMES": "",
+        "LLVM_TARGETS_TO_BUILD": "X86",
+        "WINLIBS_ROOT": "$env{WINLIBS_ROOT}"
+      }
+    },
+    {
+      "name": "host-validation",
+      "displayName": "Host compiler - wiring validation (not a Windows build)",
+      "inherits": "lmb-base",
+      "cacheVariables": {
+        "LLVM_ENABLE_PROJECTS": "clang",
+        "LLVM_ENABLE_RUNTIMES": "",
+        "LLVM_TARGETS_TO_BUILD": "X86"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "winlibs-core", "jobs": 0 },
+    { "name": "everything", "configurePreset": "winlibs-everything" },
+    { "name": "minimal", "configurePreset": "winlibs-minimal" },
+    { "name": "host-validation", "configurePreset": "host-validation" }
+  ]
+}

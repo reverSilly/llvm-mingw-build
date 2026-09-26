@@ -1,0 +1,35 @@
+# --- build working area (never commit) -------------------------------------
+work/
+build/
+dist/
+install/
+downloads/
+toolchain/
+*.log
+
+# --- resolved state / caches ------------------------------------------------
+resolved.json
+lmb-config.json
+.winlibs-release
+
+# --- archives ---------------------------------------------------------------
+*.zip
+*.7z
+*.tar.gz
+*.tar.xz
+*.sha256
+*.sha512
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
