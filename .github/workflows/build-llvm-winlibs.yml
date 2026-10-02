@@ -1,0 +1,312 @@
+name: build-llvm-winlibs
+
+# Build the whole LLVM project for Windows using the latest winlibs MinGW-w64 GCC.
+#
+# Why this runs in CI rather than in a Linux container: winlibs publishes
+# Windows-native PE binaries only (no Linux-hosted cross builds exist), so the
+# compiler itself has to run on Windows.  Trigger this with "Run workflow"
+# (workflow_dispatch) once the file is on the default branch, or push a v* tag.
+#
+# Disk/time reality check on a free 4-core / 16 GB / ~14 GB-free runner:
+#   minimal    (clang, X86)                    ~1 h,  ~10 GB build dir
+#   toolchain  (clang+extra+lld, all targets)  ~3 h,  ~16 GB build dir
+#   core       (+ mlir, + libcxx)              ~5 h,  ~25 GB build dir
+#   everything (+ lldb, flang, polly, runtimes)  does not fit a free runner:
+#              use a larger runner (see the `runner` input) or split the scope.
+# The "Free up disk space" step below reclaims 15-25 GB, which is what makes
+# `core` possible on windows-latest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_ref:
+        description: "LLVM release tag or branch (empty = latest stable release)"
+        required: false
+        default: ""
+      winlibs_tag:
+        description: "winlibs release tag (empty = latest)"
+        required: false
+        default: ""
+      scope:
+        description: "What to build"
+        required: true
+        type: choice
+        default: "core"
+        options: [core, everything, toolchain, minimal, llvm-only]
+      targets:
+        description: "LLVM_TARGETS_TO_BUILD"
+        required: false
+        default: "all"
+      build_type:
+        description: "CMake build type"
+        required: true
+        type: choice
+        default: "Release"
+        options: [Release, RelWithDebInfo, MinSizeRel, Debug]
+      runner:
+        description: "Runner label (larger runners give more disk and CPU)"
+        required: false
+        default: "windows-latest"
+      archive:
+        description: "Archive formats (zip, 7z, or 'zip,7z')"
+        required: false
+        default: "zip"
+      publish_release:
+        description: "Publish the archive as a GitHub release"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # Everything (downloads, sources, build tree, install, archives) lives under
+  # one directory so it can be cached, measured and cleaned up.
+  LMB_PREFIX: ${{ github.workspace }}/work
+  # Resolved once here so every step passes identical flags to build.py.
+  LMB_SCOPE: ${{ inputs.scope || 'core' }}
+  LMB_TARGETS: ${{ inputs.targets || 'all' }}
+  LMB_BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+  LMB_ARCHIVE: ${{ inputs.archive || 'zip' }}
+  LMB_LLVM_REF: ${{ inputs.llvm_ref || '' }}
+  LMB_WINLIBS_TAG: ${{ inputs.winlibs_tag || '' }}
+
+jobs:
+  build:
+    name: LLVM ${{ inputs.scope || 'core' }} via winlibs
+    runs-on: ${{ inputs.runner || 'windows-latest' }}
+    timeout-minutes: 360
+
+    outputs:
+      llvm_version: ${{ steps.resolve.outputs.llvm_version }}
+      llvm_tag: ${{ steps.resolve.outputs.llvm_tag }}
+      gcc_version: ${{ steps.resolve.outputs.gcc_version }}
+      mingw_version: ${{ steps.resolve.outputs.mingw_version }}
+      winlibs_tag: ${{ steps.resolve.outputs.winlibs_tag }}
+
+    steps:
+      - name: Check out the build scripts
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cmake + ninja
+        run: python -m pip install --upgrade pip cmake ninja
+
+      # A full LLVM build needs far more room than a fresh runner offers.
+      # Dropping preinstalled SDKs we do not use reclaims 15-25 GB.
+      - name: Free up disk space
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $before = (Get-PSDrive C).Free
+          $unwanted = @(
+            'C:\hostedtoolcache\windows', 'C:\Selenium', 'C:\imagemagick',
+            'C:\mingw64', 'C:\Strawberry', 'C:\Program Files\Android',
+            'C:\Program Files\dotnet\shared',
+            'C:\Program Files (x86)\Microsoft SDKs'
+          )
+          foreach ($path in $unwanted) {
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "removing $path"
+              Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $after = (Get-PSDrive C).Free
+          Write-Host ("reclaimed {0:N1} GB; {1:N1} GB free" -f (($after - $before) / 1GB), ($after / 1GB))
+
+      # Defender scanning every object file roughly doubles Windows build time.
+      - name: Exclude the build directory from Defender
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LMB_PREFIX | Out-Null
+          Add-MpPreference -ExclusionPath $env:LMB_PREFIX -ErrorAction SilentlyContinue
+          foreach ($proc in @('ninja.exe', 'gcc.exe', 'g++.exe', 'ld.exe', 'clang.exe')) {
+            Add-MpPreference -ExclusionProcess $proc -ErrorAction SilentlyContinue
+          }
+
+      # LLVM build trees routinely exceed the 260-character Win32 path limit.
+      - name: Enable Win32 long paths
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -Value 1 -Type DWord -Force
+          git config --system core.longpaths true
+
+      - name: Resolve latest LLVM + winlibs versions
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $cmd = @('build.py', 'info', '--json', '--prefix', $env:LMB_PREFIX, '--scope', $env:LMB_SCOPE)
+          if ($env:LMB_LLVM_REF)    { $cmd += @('--llvm-ref', $env:LMB_LLVM_REF) }
+          if ($env:LMB_WINLIBS_TAG) { $cmd += @('--winlibs-tag', $env:LMB_WINLIBS_TAG) }
+          python @cmd | Tee-Object -FilePath resolved.json
+          if ($LASTEXITCODE -ne 0) { throw "version resolution failed" }
+          $j = Get-Content resolved.json -Raw | ConvertFrom-Json
+          foreach ($kv in @(
+              "llvm_version=$($j.llvm.version)",
+              "llvm_tag=$($j.llvm.tag)",
+              "gcc_version=$($j.winlibs.gcc)",
+              "mingw_version=$($j.winlibs.mingw)",
+              "winlibs_tag=$($j.winlibs.tag)",
+              "archive=$($j.winlibs.archive)")) {
+            $kv | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+          Write-Host "LLVM    : $($j.llvm.tag)"
+          Write-Host "winlibs : $($j.winlibs.tag) -> $($j.winlibs.archive)"
+
+      # The two large downloads (~260 MB toolchain, ~180 MB sources) are stable
+      # for a given pair of releases, so cache them between runs.
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LMB_PREFIX }}/downloads
+          key: dl-${{ steps.resolve.outputs.winlibs_tag }}-${{ steps.resolve.outputs.llvm_tag }}-${{ runner.os }}
+          restore-keys: |
+            dl-${{ steps.resolve.outputs.winlibs_tag }}-
+            dl-
+
+      - name: Fetch the winlibs toolchain
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $cmd = @('build.py', 'fetch-toolchain', '--prefix', $env:LMB_PREFIX, '--arch', 'x86_64')
+          if ($env:LMB_WINLIBS_TAG) { $cmd += @('--winlibs-tag', $env:LMB_WINLIBS_TAG) }
+          python @cmd
+          if ($LASTEXITCODE -ne 0) { throw "toolchain fetch failed" }
+
+      - name: Show the toolchain
+        shell: pwsh
+        run: |
+          $gcc = "$env:LMB_PREFIX\toolchain\mingw64\bin\gcc.exe"
+          if (-not (Test-Path -LiteralPath $gcc)) {
+            $gcc = (Get-ChildItem -Path "$env:LMB_PREFIX\toolchain" -Recurse -Filter gcc.exe |
+                    Select-Object -First 1).FullName
+          }
+          Write-Host "using $gcc"
+          & $gcc --version
+          & $gcc -dumpmachine
+
+      - name: Fetch the LLVM sources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $cmd = @('build.py', 'fetch-llvm', '--prefix', $env:LMB_PREFIX)
+          if ($env:LMB_LLVM_REF) { $cmd += @('--llvm-ref', $env:LMB_LLVM_REF) }
+          python @cmd
+          if ($LASTEXITCODE -ne 0) { throw "source fetch failed" }
+
+      - name: Environment check
+        shell: pwsh
+        run: python build.py doctor --prefix $env:LMB_PREFIX --scope $env:LMB_SCOPE
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          python build.py configure --prefix $env:LMB_PREFIX --scope $env:LMB_SCOPE `
+            --targets $env:LMB_TARGETS --build-type $env:LMB_BUILD_TYPE `
+            --jobs $env:NUMBER_OF_PROCESSORS --link-jobs 1
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          python build.py build --prefix $env:LMB_PREFIX --scope $env:LMB_SCOPE `
+            --targets $env:LMB_TARGETS --build-type $env:LMB_BUILD_TYPE `
+            --jobs $env:NUMBER_OF_PROCESSORS --link-jobs 1
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Install
+        shell: pwsh
+        run: |
+          python build.py install --prefix $env:LMB_PREFIX --scope $env:LMB_SCOPE `
+            --targets $env:LMB_TARGETS --build-type $env:LMB_BUILD_TYPE
+          if ($LASTEXITCODE -ne 0) { throw "install failed" }
+
+      - name: Smoke test the produced toolchain
+        shell: pwsh
+        run: |
+          python build.py smoke-test --prefix $env:LMB_PREFIX --scope $env:LMB_SCOPE `
+            --targets $env:LMB_TARGETS --build-type $env:LMB_BUILD_TYPE
+          if ($LASTEXITCODE -ne 0) { throw "smoke test failed" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          python build.py package --prefix $env:LMB_PREFIX --scope $env:LMB_SCOPE `
+            --targets $env:LMB_TARGETS --build-type $env:LMB_BUILD_TYPE `
+            --archive $env:LMB_ARCHIVE
+          if ($LASTEXITCODE -ne 0) { throw "packaging failed" }
+
+      - name: Show what we produced
+        shell: pwsh
+        run: |
+          Get-ChildItem "$env:LMB_PREFIX\dist" | Sort-Object Length -Descending | ForEach-Object {
+            Write-Host ("{0,10:N1} MB  {1}" -f ($_.Length / 1MB), $_.Name)
+          }
+          Get-ChildItem "$env:LMB_PREFIX\dist\*.sha256" | ForEach-Object { Get-Content $_.FullName }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-${{ steps.resolve.outputs.llvm_version }}-winlibs-gcc${{ steps.resolve.outputs.gcc_version }}-${{ inputs.scope || 'core' }}
+          path: |
+            ${{ env.LMB_PREFIX }}/dist/*
+            ${{ env.LMB_PREFIX }}/build/build.log
+            ${{ env.LMB_PREFIX }}/build/lmb-config.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish GitHub release
+        if: ${{ inputs.publish_release == true || startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLVM_VERSION: ${{ steps.resolve.outputs.llvm_version }}
+          GCC_VERSION: ${{ steps.resolve.outputs.gcc_version }}
+          MINGW_VERSION: ${{ steps.resolve.outputs.mingw_version }}
+          WINLIBS_TAG: ${{ steps.resolve.outputs.winlibs_tag }}
+          RUNNER_LABEL: ${{ inputs.runner || 'windows-latest' }}
+          GITHUB_REF_NAME: ${{ github.ref }}
+        run: |
+          $tag = if ($env:GITHUB_REF_NAME.StartsWith('refs/tags/')) {
+                   $env:GITHUB_REF_NAME.Substring('refs/tags/'.Length)
+                 } else {
+                   "llvm-$($env:LLVM_VERSION)-gcc-$($env:GCC_VERSION)"
+                 }
+          $files = @(Get-ChildItem "$env:LMB_PREFIX\dist" -File | ForEach-Object { $_.FullName })
+          if ($files.Count -eq 0) { throw "nothing to publish" }
+          $notes = @"
+          Prebuilt LLVM $($env:LLVM_VERSION) for Windows x86_64 (UCRT), compiled with
+          winlibs GCC $($env:GCC_VERSION) + MinGW-w64 $($env:MINGW_VERSION)
+          ($($env:WINLIBS_TAG)).
+
+          | setting | value |
+          | --- | --- |
+          | scope | $env:LMB_SCOPE |
+          | targets | $env:LMB_TARGETS |
+          | build type | $env:LMB_BUILD_TYPE |
+          | runner | $env:RUNNER_LABEL |
+
+          Checksums are attached as .sha256 / .sha512 sidecar files.
+          "@
+          gh release create $tag @files --title "LLVM $($env:LLVM_VERSION) (winlibs GCC $($env:GCC_VERSION))" --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw "release publishing failed" }
